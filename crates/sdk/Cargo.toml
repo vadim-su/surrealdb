@@ -208,4 +208,7 @@ harness = false
 
 [[bench]]
 name = "array_intersect"
+
+[[bench]]
+name = "index_fulltext"
 harness = false

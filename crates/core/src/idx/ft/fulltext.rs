@@ -1832,9 +1832,6 @@ mod tests {
 		let score_short = fast.compute_score(1.0, 5.0, encoded_short);
 		let score_long = fast.compute_score(1.0, 5.0, encoded_long);
 
-		assert_ne!(
-			score_short, score_long,
-			"Different lengths should produce different scores"
-		);
+		assert_ne!(score_short, score_long, "Different lengths should produce different scores");
 	}
 }

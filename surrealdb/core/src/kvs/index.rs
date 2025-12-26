@@ -520,14 +520,11 @@ impl Building {
 
 			let batch = {
 				let tx = self.new_read_tx().await?;
-				// Check if the index has been decommissioned (skip in blocking mode
-				// because the creating transaction may not be committed yet)
-				if !self.skip_prepare_remove_checks {
-					catch!(
-						tx,
-						self.check_prepare_remove_with_tx(&mut last_prepare_remove_check, &tx).await
-					);
-				}
+				// Check if the index has been decommissioned
+				catch!(
+					tx,
+					self.check_prepare_remove_with_tx(&mut last_prepare_remove_check, &tx).await
+				);
 				// Get the next batch of records
 				let res = catch!(tx, tx.batch_keys_vals(rng, *INDEXING_BATCH_SIZE, None).await);
 				tx.cancel().await?;

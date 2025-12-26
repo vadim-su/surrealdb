@@ -3,13 +3,18 @@ use std::hash::{Hash, Hasher};
 use revision::revisioned;
 use surrealdb_types::{SqlFormat, ToSql, write_sql};
 
-#[revisioned(revision = 1)]
+#[revisioned(revision = 2)]
 #[derive(Clone, Debug, PartialOrd)]
 pub enum Scoring {
 	Bm {
 		k1: f32,
 		b: f32,
 	}, // BestMatching25
+	#[revision(start = 2)]
+	BmAccurate {
+		k1: f32,
+		b: f32,
+	}, // BestMatching25 with accurate (non-optimized) scoring
 	Vs, // VectorSearch
 }
 
@@ -28,6 +33,16 @@ impl PartialEq for Scoring {
 					b: other_b,
 				},
 			) => k1.to_bits() == other_k1.to_bits() && b.to_bits() == other_b.to_bits(),
+			(
+				Scoring::BmAccurate {
+					k1,
+					b,
+				},
+				Scoring::BmAccurate {
+					k1: other_k1,
+					b: other_b,
+				},
+			) => k1.to_bits() == other_k1.to_bits() && b.to_bits() == other_b.to_bits(),
 			(Scoring::Vs, Scoring::Vs) => true,
 			_ => false,
 		}
@@ -41,10 +56,19 @@ impl Hash for Scoring {
 				k1,
 				b,
 			} => {
+				0u8.hash(state);
 				k1.to_bits().hash(state);
 				b.to_bits().hash(state);
 			}
-			Scoring::Vs => 0.hash(state),
+			Scoring::BmAccurate {
+				k1,
+				b,
+			} => {
+				1u8.hash(state);
+				k1.to_bits().hash(state);
+				b.to_bits().hash(state);
+			}
+			Scoring::Vs => 2u8.hash(state),
 		}
 	}
 }
@@ -65,6 +89,10 @@ impl ToSql for Scoring {
 				k1,
 				b,
 			} => write_sql!(f, sql_fmt, "BM25({},{})", k1, b),
+			Self::BmAccurate {
+				k1,
+				b,
+			} => write_sql!(f, sql_fmt, "BM25_ACCURATE({},{})", k1, b),
 			Self::Vs => write_sql!(f, sql_fmt, "VS"),
 		}
 	}
@@ -80,6 +108,13 @@ impl From<Scoring> for crate::catalog::Scoring {
 				k1,
 				b,
 			},
+			Scoring::BmAccurate {
+				k1,
+				b,
+			} => crate::catalog::Scoring::BmAccurate {
+				k1,
+				b,
+			},
 			Scoring::Vs => crate::catalog::Scoring::Vs,
 		}
 	}
@@ -91,6 +126,13 @@ impl From<crate::catalog::Scoring> for Scoring {
 				k1,
 				b,
 			} => Self::Bm {
+				k1,
+				b,
+			},
+			crate::catalog::Scoring::BmAccurate {
+				k1,
+				b,
+			} => Self::BmAccurate {
 				k1,
 				b,
 			},

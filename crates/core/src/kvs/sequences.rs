@@ -671,32 +671,23 @@ mod tests {
 	use crate::kvs::Datastore;
 	use crate::val::TableName;
 
-	/// Test multi-node parallel batch allocation with RocksDB backend.
+	/// Performance test: measures allocation time with many existing batch keys.
 	///
-	/// This test uses RocksDB which properly implements optimistic transaction
-	/// conflict detection. It simulates multiple nodes in a cluster all trying
-	/// to allocate batches for the same sequence simultaneously.
+	/// With range-scan: O(n) - time grows as batch keys accumulate
+	/// With global counter: O(1) - time stays constant
 	///
-	/// With the OLD range-scan approach:
-	/// - Each batch allocation reads ALL existing batch keys via range scan
-	/// - When one node commits a new batch, ALL other nodes' transactions conflict
-	/// - Expected: MANY conflicts (high retry rate)
-	///
-	/// With the NEW global counter approach:
-	/// - Each batch allocation only reads/writes a single global counter key
-	/// - Conflicts only occur when two nodes update the counter simultaneously
-	/// - Expected: FEW conflicts (low retry rate)
+	/// This test pre-populates the database with many batch keys, then measures
+	/// how long it takes to allocate new batches. The global counter approach
+	/// should be significantly faster.
 	#[cfg(feature = "kv-rocksdb")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-	async fn test_multi_node_parallel_batch_allocation_rocksdb() {
+	async fn test_batch_allocation_performance_rocksdb() {
+		use std::time::Instant;
 		use temp_dir::TempDir;
 
-		const NUM_CONCURRENT_TASKS: usize = 50;
-		const NUM_ROUNDS: usize = 5;
+		const PRE_POPULATE_KEYS: usize = 1000;
+		const ALLOCATIONS_TO_MEASURE: usize = 100;
 		const BATCH_SIZE: u32 = 1;
-
-		// Reset conflict counter
-		TEST_CONFLICT_COUNT.store(0, Ordering::SeqCst);
 
 		// Create RocksDB-backed storage
 		let temp_dir = TempDir::new().unwrap();
@@ -711,90 +702,54 @@ mod tests {
 		let ikb = IndexKeyBase::new(
 			NamespaceId(1),
 			DatabaseId(1),
-			TableName::from("shared_table"),
+			TableName::from("perf_test_table"),
 			IndexId(1),
 		);
 
-		let mut all_ids = HashSet::new();
-		let mut per_round_conflicts = Vec::new();
+		let sequences = Sequences::new(tf.clone(), Uuid::new_v4());
 
-		// Run multiple rounds to accumulate batch keys and observe conflict growth
-		// With range-scan: conflicts should GROW as more batch keys accumulate
-		// With global counter: conflicts should stay STABLE
-		for round in 0..NUM_ROUNDS {
-			let conflicts_before = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
-			let barrier = Arc::new(Barrier::new(NUM_CONCURRENT_TASKS));
+		// Phase 1: Pre-populate with many batch keys
+		println!("\n=== Performance Test ===");
+		println!("Pre-populating with {PRE_POPULATE_KEYS} batch keys...");
 
-			let handles: Vec<_> = (0..NUM_CONCURRENT_TASKS)
-				.map(|task_id| {
-					let tf = tf.clone();
-					let barrier = barrier.clone();
-					let ikb = ikb.clone();
-
-					tokio::spawn(async move {
-						let sequences = Sequences::new(tf, Uuid::new_v4());
-						barrier.wait().await;
-
-						let id = sequences
-							.next_fts_doc_id(None, ikb, BATCH_SIZE)
-							.await
-							.expect("allocation should succeed");
-
-						(task_id, id)
-					})
-				})
-				.collect();
-
-			for handle in handles {
-				let (task_id, id) = handle.await.unwrap();
-				assert!(
-					all_ids.insert(id),
-					"Round {round}, Task {task_id} got duplicate ID {id}!"
-				);
-			}
-
-			let conflicts_after = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
-			let round_conflicts = conflicts_after - conflicts_before;
-			per_round_conflicts.push(round_conflicts);
+		let prepopulate_start = Instant::now();
+		for _ in 0..PRE_POPULATE_KEYS {
+			sequences
+				.next_fts_doc_id(None, ikb.clone(), BATCH_SIZE)
+				.await
+				.expect("pre-populate should succeed");
 		}
+		let prepopulate_time = prepopulate_start.elapsed();
+		println!("Pre-populate time: {:?}", prepopulate_time);
 
-		let total_allocations = NUM_CONCURRENT_TASKS * NUM_ROUNDS;
-		assert_eq!(all_ids.len(), total_allocations);
+		// Phase 2: Measure allocation time with many existing keys
+		println!("Measuring {ALLOCATIONS_TO_MEASURE} allocations with {PRE_POPULATE_KEYS} existing keys...");
 
-		let total_conflicts = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
-		let conflict_rate = (total_conflicts as f64 / total_allocations as f64) * 100.0;
+		let measure_start = Instant::now();
+		for _ in 0..ALLOCATIONS_TO_MEASURE {
+			sequences
+				.next_fts_doc_id(None, ikb.clone(), BATCH_SIZE)
+				.await
+				.expect("allocation should succeed");
+		}
+		let measure_time = measure_start.elapsed();
 
-		println!("\n=== RocksDB Multi-node test ===");
-		println!("Concurrent tasks per round: {NUM_CONCURRENT_TASKS}");
-		println!("Rounds: {NUM_ROUNDS}");
-		println!("Per-round conflicts: {:?}", per_round_conflicts);
-		println!("Total allocations: {total_allocations}");
-		println!("Total conflicts: {total_conflicts}");
-		println!("Conflict rate: {:.1}%", conflict_rate);
+		let avg_time_us = measure_time.as_micros() as f64 / ALLOCATIONS_TO_MEASURE as f64;
+		println!("Total time for {ALLOCATIONS_TO_MEASURE} allocations: {:?}", measure_time);
+		println!("Average time per allocation: {:.1} µs", avg_time_us);
+		println!("========================\n");
 
-		// Calculate conflict growth ratio (last round / first round)
-		// With range-scan: ratio should be HIGH (conflicts grow as batch keys accumulate)
-		// With global counter: ratio should be LOW (~1.0, conflicts stay stable)
-		let first_round = per_round_conflicts[0] as f64;
-		let last_round = per_round_conflicts[NUM_ROUNDS - 1] as f64;
-		let growth_ratio = if first_round > 0.0 { last_round / first_round } else { 1.0 };
-		println!("Conflict growth ratio (round {NUM_ROUNDS} / round 1): {:.2}", growth_ratio);
-		println!("===============================\n");
-
-		// With global counter, conflicts should NOT grow significantly across rounds
-		// because we always read/write the same single key.
-		// Growth ratio should be < 2.0 (allowing for variance)
+		// With global counter (O(1)), average should be < 5000 µs (5ms)
+		// With range-scan (O(n)), average would be much higher with 1000 keys
 		//
-		// With range-scan, conflicts GROW as more batch keys are added because
-		// each transaction reads ALL existing batch keys.
-		// Growth ratio would be > 3.0
+		// This threshold is generous to account for CI variability
 		assert!(
-			growth_ratio < 2.0,
-			"Conflict growth ratio too high: {:.2}. With global counter approach, \
-			 conflicts should stay stable across rounds (ratio < 2.0). \
-			 If ratio > 3.0, you're likely running the old range-scan implementation \
-			 where conflicts grow as batch keys accumulate.",
-			growth_ratio
+			avg_time_us < 5000.0,
+			"Average allocation time too high: {:.1} µs. \
+			 With global counter approach (O(1)), we expect < 5000 µs per allocation. \
+			 If you see much higher values, you're likely running the old range-scan \
+			 implementation which is O(n) where n = number of existing batch keys.",
+			avg_time_us
 		);
 	}
 

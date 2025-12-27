@@ -26,6 +26,7 @@ use crate::key::index::hv::Hv;
 use crate::key::index::ia::Ia;
 use crate::key::index::ib::Ib;
 use crate::key::index::id::Id as IdKey;
+use crate::key::index::ig::Ig;
 use crate::key::index::ii::Ii;
 use crate::key::index::ip::Ip;
 use crate::key::index::is::Is;
@@ -118,6 +119,10 @@ impl IndexKeyBase {
 
 	pub(crate) fn new_ib_range(&self) -> Result<Range<Key>> {
 		Ib::new_range(self.0.ns, self.0.db, &self.0.tb, self.0.ix)
+	}
+
+	pub(crate) fn new_ig_key(&self) -> Ig<'_> {
+		Ig::new(self.0.ns, self.0.db, &self.0.tb, self.0.ix)
 	}
 
 	pub(crate) fn new_is_key(&self, nid: Uuid) -> Is<'_> {

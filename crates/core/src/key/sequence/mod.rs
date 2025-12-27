@@ -1,5 +1,6 @@
 //! Stores sequence states
 pub mod ba;
+pub mod sg;
 pub mod st;
 
 use std::borrow::Cow;

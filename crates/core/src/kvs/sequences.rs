@@ -38,15 +38,20 @@ use crate::ctx::Context;
 use crate::err::Error;
 use crate::idx::IndexKeyBase;
 use crate::idx::seqdocids::DocId;
+use crate::key::database::tg::TableIdGeneratorGlobalKey;
 use crate::key::database::th::TableIdGeneratorBatchKey;
 use crate::key::database::ti::TableIdGeneratorStateKey;
+use crate::key::namespace::dg::DatabaseIdGeneratorGlobalKey;
 use crate::key::namespace::dh::DatabaseIdGeneratorBatchKey;
 use crate::key::namespace::di::DatabaseIdGeneratorStateKey;
+use crate::key::root::ng::NamespaceIdGeneratorGlobalKey;
 use crate::key::root::nh::NamespaceIdGeneratorBatchKey;
 use crate::key::root::ni::NamespaceIdGeneratorStateKey;
 use crate::key::sequence::Prefix;
 use crate::key::sequence::ba::Ba;
+use crate::key::sequence::sg::Sg;
 use crate::key::sequence::st::St;
+use crate::key::table::ig::IndexIdGeneratorGlobalKey;
 use crate::key::table::ih::IndexIdGeneratorBatchKey;
 use crate::key::table::is::IndexIdGeneratorStateKey;
 use crate::kvs::ds::TransactionFactory;
@@ -146,6 +151,22 @@ impl SequenceDomain {
 			Self::IndexIds(ns, db, tb) => {
 				IndexIdGeneratorStateKey::new(*ns, *db, tb, nid).encode_key()
 			}
+		}
+	}
+
+	/// Returns the global counter key for this sequence domain.
+	///
+	/// The global counter stores the next available batch start value,
+	/// eliminating the need for range scans during batch allocation.
+	/// This significantly reduces transaction conflicts in concurrent scenarios.
+	fn new_global_counter_key(&self) -> Result<Vec<u8>> {
+		match &self {
+			Self::UserName(ns, db, sq) => Sg::new(*ns, *db, sq).encode_key(),
+			Self::FullTextDocIds(ikb) => ikb.new_ig_key().encode_key(),
+			Self::NameSpacesIds => NamespaceIdGeneratorGlobalKey::new().encode_key(),
+			Self::DatabasesIds(ns) => DatabaseIdGeneratorGlobalKey::new(*ns).encode_key(),
+			Self::TablesIds(ns, db) => TableIdGeneratorGlobalKey::new(*ns, *db).encode_key(),
+			Self::IndexIds(ns, db, tb) => IndexIdGeneratorGlobalKey::new(*ns, *db, tb).encode_key(),
 		}
 	}
 }
@@ -545,9 +566,10 @@ impl Sequence {
 
 	/// Attempts to allocate a batch of IDs in a single transaction.
 	///
-	/// This method scans existing batch allocations to find the highest allocated ID,
-	/// reuses existing batches owned by this node if available, and creates a new
-	/// batch allocation if needed. The entire operation is atomic within a transaction.
+	/// This method uses a global counter to determine the next available batch start,
+	/// avoiding range scans that caused transaction conflicts in concurrent scenarios.
+	/// The global counter approach significantly reduces the read-set size and
+	/// prevents conflicts when multiple nodes allocate batches simultaneously.
 	///
 	/// # Arguments
 	/// * `sqs` - The sequences manager
@@ -568,34 +590,34 @@ impl Sequence {
 
 		// Execute operations and ensure transaction is cancelled on error
 		let result = async {
-			let batch_range = seq.new_batch_range_keys()?;
-			let val = tx.getr(batch_range, None).await?;
-			let mut next_start = next;
-			// Scan every existing batch
-			for (key, val) in val.iter() {
-				let ba: BatchValue = revision::from_slice(val)?;
-				next_start = next_start.max(ba.to);
-				// The batch belongs to this node
-				if ba.owner == sqs.nid {
-					// If a previous batch belongs to this node, we can remove it,
-					// as we are going to create a new one
-					// If the current value is still in the batch range, we return it
-					if next < ba.to {
-						return Ok((next, ba.to));
-					}
-					// Otherwise we can remove this old batch and create a new one
-					tx.del(key).await?;
+			// Read the global counter to find the next available batch start.
+			// This replaces the range scan of all batch keys, dramatically reducing
+			// the transaction's read-set and preventing conflicts.
+			let global_key = seq.new_global_counter_key()?;
+			let global_counter: i64 = match tx.get(&global_key, None).await? {
+				Some(bytes) if bytes.len() == 8 => {
+					i64::from_be_bytes(bytes.try_into().expect("length checked"))
 				}
-			}
-			// We compute the new batch
+				_ => 0,
+			};
+
+			// Compute the new batch start as the maximum of the global counter
+			// and the requested next value
+			let next_start = next.max(global_counter);
 			let next_to = next_start + batch as i64;
-			// And store it in the KV store
+
+			// Update the global counter to reflect the new allocation
+			let next_to_bytes = next_to.to_be_bytes().to_vec();
+			tx.set(&global_key, &next_to_bytes, None).await?;
+
+			// Store the batch allocation for this node (for visibility and recovery)
 			let bv = revision::to_vec(&BatchValue {
 				to: next_to,
 				owner: sqs.nid,
 			})?;
 			let batch_key = seq.new_batch_key(next_start)?;
 			tx.set(&batch_key, &bv, None).await?;
+
 			Ok::<(i64, i64), anyhow::Error>((next_start, next_to))
 		}
 		.await;

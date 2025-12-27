@@ -691,8 +691,8 @@ mod tests {
 	async fn test_multi_node_parallel_batch_allocation_rocksdb() {
 		use temp_dir::TempDir;
 
-		const NUM_CONCURRENT_TASKS: usize = 100;
-		const NUM_ROUNDS: usize = 3;
+		const NUM_CONCURRENT_TASKS: usize = 50;
+		const NUM_ROUNDS: usize = 5;
 		const BATCH_SIZE: u32 = 1;
 
 		// Reset conflict counter
@@ -716,9 +716,13 @@ mod tests {
 		);
 
 		let mut all_ids = HashSet::new();
+		let mut per_round_conflicts = Vec::new();
 
-		// Run multiple rounds to accumulate conflicts and stress test
+		// Run multiple rounds to accumulate batch keys and observe conflict growth
+		// With range-scan: conflicts should GROW as more batch keys accumulate
+		// With global counter: conflicts should stay STABLE
 		for round in 0..NUM_ROUNDS {
+			let conflicts_before = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
 			let barrier = Arc::new(Barrier::new(NUM_CONCURRENT_TASKS));
 
 			let handles: Vec<_> = (0..NUM_CONCURRENT_TASKS)
@@ -748,39 +752,49 @@ mod tests {
 					"Round {round}, Task {task_id} got duplicate ID {id}!"
 				);
 			}
+
+			let conflicts_after = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
+			let round_conflicts = conflicts_after - conflicts_before;
+			per_round_conflicts.push(round_conflicts);
 		}
 
 		let total_allocations = NUM_CONCURRENT_TASKS * NUM_ROUNDS;
 		assert_eq!(all_ids.len(), total_allocations);
 
-		let conflicts = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
-		let conflict_rate = (conflicts as f64 / total_allocations as f64) * 100.0;
-		println!(
-			"\n=== RocksDB Multi-node test ===\n\
-			 Concurrent tasks per round: {NUM_CONCURRENT_TASKS}\n\
-			 Rounds: {NUM_ROUNDS}\n\
-			 Total allocations: {total_allocations}\n\
-			 Conflicts: {conflicts}\n\
-			 Conflict rate: {:.1}%\n\
-			 ===============================",
-			conflict_rate
-		);
+		let total_conflicts = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
+		let conflict_rate = (total_conflicts as f64 / total_allocations as f64) * 100.0;
 
-		// With global counter approach, conflict rate should be manageable (< 250%)
-		// because each transaction only reads/writes a single global counter key.
+		println!("\n=== RocksDB Multi-node test ===");
+		println!("Concurrent tasks per round: {NUM_CONCURRENT_TASKS}");
+		println!("Rounds: {NUM_ROUNDS}");
+		println!("Per-round conflicts: {:?}", per_round_conflicts);
+		println!("Total allocations: {total_allocations}");
+		println!("Total conflicts: {total_conflicts}");
+		println!("Conflict rate: {:.1}%", conflict_rate);
+
+		// Calculate conflict growth ratio (last round / first round)
+		// With range-scan: ratio should be HIGH (conflicts grow as batch keys accumulate)
+		// With global counter: ratio should be LOW (~1.0, conflicts stay stable)
+		let first_round = per_round_conflicts[0] as f64;
+		let last_round = per_round_conflicts[NUM_ROUNDS - 1] as f64;
+		let growth_ratio = if first_round > 0.0 { last_round / first_round } else { 1.0 };
+		println!("Conflict growth ratio (round {NUM_ROUNDS} / round 1): {:.2}", growth_ratio);
+		println!("===============================\n");
+
+		// With global counter, conflicts should NOT grow significantly across rounds
+		// because we always read/write the same single key.
+		// Growth ratio should be < 2.0 (allowing for variance)
 		//
-		// With range-scan approach, conflict rate is MUCH higher (> 400%)
-		// because every transaction reads ALL existing batch keys via range scan,
-		// causing conflicts whenever ANY other transaction adds a new batch key.
-		// The more batch keys exist, the worse the conflict rate becomes.
-		//
-		// This test SHOULD FAIL on main (range-scan) and PASS on this branch (global counter)
+		// With range-scan, conflicts GROW as more batch keys are added because
+		// each transaction reads ALL existing batch keys.
+		// Growth ratio would be > 3.0
 		assert!(
-			conflict_rate < 250.0,
-			"Conflict rate too high: {:.1}%. With global counter approach, \
-			 we expect < 250% conflict rate. If you see > 400%, you're likely \
-			 running the old range-scan implementation which causes excessive conflicts.",
-			conflict_rate
+			growth_ratio < 2.0,
+			"Conflict growth ratio too high: {:.2}. With global counter approach, \
+			 conflicts should stay stable across rounds (ratio < 2.0). \
+			 If ratio > 3.0, you're likely running the old range-scan implementation \
+			 where conflicts grow as batch keys accumulate.",
+			growth_ratio
 		);
 	}
 

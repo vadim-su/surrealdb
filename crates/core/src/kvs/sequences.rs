@@ -634,3 +634,165 @@ impl Sequence {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashSet;
+	use std::sync::Arc;
+
+	use tokio::sync::Barrier;
+
+	use crate::kvs::Datastore;
+
+	/// Test that parallel sequence allocations don't conflict.
+	///
+	/// Before the fix (using range scans), this test would fail with
+	/// "Transaction conflict: Resource busy" errors because all parallel
+	/// transactions would read the same range of batch keys, and when one
+	/// transaction wrote a new batch key, all others would conflict.
+	///
+	/// After the fix (using global counters), this test passes because
+	/// each transaction only reads/writes a single global counter key,
+	/// dramatically reducing the conflict window.
+	#[tokio::test]
+	async fn test_parallel_sequence_allocation_no_conflicts() {
+		const NUM_WORKERS: usize = 8;
+		const IDS_PER_WORKER: usize = 100;
+
+		let ds = Arc::new(Datastore::new("memory").await.unwrap());
+		let barrier = Arc::new(Barrier::new(NUM_WORKERS));
+
+		// Spawn multiple workers that allocate IDs in parallel
+		let handles: Vec<_> = (0..NUM_WORKERS)
+			.map(|worker_id| {
+				let ds = ds.clone();
+				let barrier = barrier.clone();
+
+				tokio::spawn(async move {
+					// Wait for all workers to be ready
+					barrier.wait().await;
+
+					let mut ids = Vec::with_capacity(IDS_PER_WORKER);
+
+					for _ in 0..IDS_PER_WORKER {
+						// Each worker allocates namespace IDs
+						// This exercises the sequence allocation path
+						let id = ds
+							.sequences()
+							.next_namespace_id(None)
+							.await
+							.expect("allocation should succeed without conflicts");
+
+						ids.push(id.0);
+					}
+
+					(worker_id, ids)
+				})
+			})
+			.collect();
+
+		// Collect all results
+		let mut all_ids = HashSet::new();
+		let mut total_count = 0;
+
+		for handle in handles {
+			let (worker_id, ids) = handle.await.expect("worker should complete");
+			println!("Worker {worker_id} allocated {} IDs", ids.len());
+
+			for id in ids {
+				// Each ID should be unique
+				assert!(
+					all_ids.insert(id),
+					"ID {id} was allocated more than once - this indicates a bug!"
+				);
+				total_count += 1;
+			}
+		}
+
+		// Verify we got all expected IDs
+		assert_eq!(
+			total_count,
+			NUM_WORKERS * IDS_PER_WORKER,
+			"Expected {} total IDs, got {}",
+			NUM_WORKERS * IDS_PER_WORKER,
+			total_count
+		);
+
+		println!(
+			"Successfully allocated {} unique IDs across {} parallel workers",
+			total_count, NUM_WORKERS
+		);
+	}
+
+	/// Test parallel FT doc ID allocation (the most common conflict scenario).
+	///
+	/// This simulates the scenario from the bug report where parallel INSERT
+	/// operations into a table with a full-text index caused conflicts.
+	#[tokio::test]
+	async fn test_parallel_fts_doc_id_allocation() {
+		use crate::catalog::{DatabaseId, IndexId, NamespaceId};
+		use crate::idx::IndexKeyBase;
+		use crate::val::TableName;
+
+		const NUM_WORKERS: usize = 8;
+		const IDS_PER_WORKER: usize = 50;
+
+		let ds = Arc::new(Datastore::new("memory").await.unwrap());
+		let barrier = Arc::new(Barrier::new(NUM_WORKERS));
+
+		// Create a shared IndexKeyBase (simulating a FT index on a table)
+		let ikb = IndexKeyBase::new(
+			NamespaceId(1),
+			DatabaseId(1),
+			TableName::from("test_table"),
+			IndexId(1),
+		);
+
+		let handles: Vec<_> = (0..NUM_WORKERS)
+			.map(|worker_id| {
+				let ds = ds.clone();
+				let barrier = barrier.clone();
+				let ikb = ikb.clone();
+
+				tokio::spawn(async move {
+					barrier.wait().await;
+
+					let mut doc_ids = Vec::with_capacity(IDS_PER_WORKER);
+
+					for _ in 0..IDS_PER_WORKER {
+						let doc_id = ds
+							.sequences()
+							.next_fts_doc_id(None, ikb.clone(), 100)
+							.await
+							.expect("FTS doc ID allocation should succeed");
+
+						doc_ids.push(doc_id);
+					}
+
+					(worker_id, doc_ids)
+				})
+			})
+			.collect();
+
+		let mut all_doc_ids = HashSet::new();
+
+		for handle in handles {
+			let (worker_id, doc_ids) = handle.await.expect("worker should complete");
+			println!("Worker {worker_id} allocated {} FTS doc IDs", doc_ids.len());
+
+			for doc_id in doc_ids {
+				assert!(
+					all_doc_ids.insert(doc_id),
+					"FTS DocId {doc_id} was allocated more than once!"
+				);
+			}
+		}
+
+		assert_eq!(all_doc_ids.len(), NUM_WORKERS * IDS_PER_WORKER);
+		println!(
+			"Successfully allocated {} unique FTS doc IDs across {} parallel workers",
+			all_doc_ids.len(),
+			NUM_WORKERS
+		);
+	}
+}

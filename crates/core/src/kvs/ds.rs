@@ -753,6 +753,14 @@ impl Datastore {
 		self.id
 	}
 
+	/// Returns a reference to the sequences manager for this datastore.
+	///
+	/// Used for testing parallel sequence allocation.
+	#[cfg(test)]
+	pub(crate) fn sequences(&self) -> &Sequences {
+		&self.sequences
+	}
+
 	/// Does the datastore allow excecuting an RPC method?
 	pub(crate) fn allows_rpc_method(&self, method_target: &MethodTarget) -> bool {
 		self.capabilities.allows_rpc_method(method_target)

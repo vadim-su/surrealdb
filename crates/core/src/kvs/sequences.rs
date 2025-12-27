@@ -691,7 +691,8 @@ mod tests {
 	async fn test_multi_node_parallel_batch_allocation_rocksdb() {
 		use temp_dir::TempDir;
 
-		const NUM_CONCURRENT_TASKS: usize = 50;
+		const NUM_CONCURRENT_TASKS: usize = 100;
+		const NUM_ROUNDS: usize = 3;
 		const BATCH_SIZE: u32 = 1;
 
 		// Reset conflict counter
@@ -714,57 +715,70 @@ mod tests {
 			IndexId(1),
 		);
 
-		let barrier = Arc::new(Barrier::new(NUM_CONCURRENT_TASKS));
-
-		let handles: Vec<_> = (0..NUM_CONCURRENT_TASKS)
-			.map(|task_id| {
-				let tf = tf.clone();
-				let barrier = barrier.clone();
-				let ikb = ikb.clone();
-
-				tokio::spawn(async move {
-					let sequences = Sequences::new(tf, Uuid::new_v4());
-					barrier.wait().await;
-
-					let id = sequences
-						.next_fts_doc_id(None, ikb, BATCH_SIZE)
-						.await
-						.expect("allocation should succeed");
-
-					(task_id, id)
-				})
-			})
-			.collect();
-
 		let mut all_ids = HashSet::new();
-		for handle in handles {
-			let (task_id, id) = handle.await.unwrap();
-			assert!(all_ids.insert(id), "Task {task_id} got duplicate ID {id}!");
+
+		// Run multiple rounds to accumulate conflicts and stress test
+		for round in 0..NUM_ROUNDS {
+			let barrier = Arc::new(Barrier::new(NUM_CONCURRENT_TASKS));
+
+			let handles: Vec<_> = (0..NUM_CONCURRENT_TASKS)
+				.map(|task_id| {
+					let tf = tf.clone();
+					let barrier = barrier.clone();
+					let ikb = ikb.clone();
+
+					tokio::spawn(async move {
+						let sequences = Sequences::new(tf, Uuid::new_v4());
+						barrier.wait().await;
+
+						let id = sequences
+							.next_fts_doc_id(None, ikb, BATCH_SIZE)
+							.await
+							.expect("allocation should succeed");
+
+						(task_id, id)
+					})
+				})
+				.collect();
+
+			for handle in handles {
+				let (task_id, id) = handle.await.unwrap();
+				assert!(
+					all_ids.insert(id),
+					"Round {round}, Task {task_id} got duplicate ID {id}!"
+				);
+			}
 		}
 
-		assert_eq!(all_ids.len(), NUM_CONCURRENT_TASKS);
+		let total_allocations = NUM_CONCURRENT_TASKS * NUM_ROUNDS;
+		assert_eq!(all_ids.len(), total_allocations);
 
 		let conflicts = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
-		let conflict_rate = (conflicts as f64 / NUM_CONCURRENT_TASKS as f64) * 100.0;
+		let conflict_rate = (conflicts as f64 / total_allocations as f64) * 100.0;
 		println!(
 			"\n=== RocksDB Multi-node test ===\n\
-			 Concurrent tasks: {NUM_CONCURRENT_TASKS}\n\
+			 Concurrent tasks per round: {NUM_CONCURRENT_TASKS}\n\
+			 Rounds: {NUM_ROUNDS}\n\
+			 Total allocations: {total_allocations}\n\
 			 Conflicts: {conflicts}\n\
 			 Conflict rate: {:.1}%\n\
 			 ===============================",
 			conflict_rate
 		);
 
-		// With global counter approach, conflict rate should be manageable (< 300%)
-		// With range-scan approach, conflict rate would be MUCH higher (> 500%)
-		// because every transaction reads ALL batch keys, causing conflicts
-		// whenever ANY other transaction adds a new batch key.
+		// With global counter approach, conflict rate should be manageable (< 250%)
+		// because each transaction only reads/writes a single global counter key.
+		//
+		// With range-scan approach, conflict rate is MUCH higher (> 400%)
+		// because every transaction reads ALL existing batch keys via range scan,
+		// causing conflicts whenever ANY other transaction adds a new batch key.
+		// The more batch keys exist, the worse the conflict rate becomes.
 		//
 		// This test SHOULD FAIL on main (range-scan) and PASS on this branch (global counter)
 		assert!(
-			conflict_rate < 300.0,
+			conflict_rate < 250.0,
 			"Conflict rate too high: {:.1}%. With global counter approach, \
-			 we expect < 300% conflict rate. If you see > 500%, you're likely \
+			 we expect < 250% conflict rate. If you see > 400%, you're likely \
 			 running the old range-scan implementation which causes excessive conflicts.",
 			conflict_rate
 		);

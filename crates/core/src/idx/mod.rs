@@ -117,6 +117,11 @@ impl IndexKeyBase {
 		)
 	}
 
+	/// Returns the range of batch keys for FT index document IDs.
+	///
+	/// This method was used in the old range-scan approach but is kept for
+	/// debugging and potential recovery scenarios.
+	#[allow(dead_code)]
 	pub(crate) fn new_ib_range(&self) -> Result<Range<Key>> {
 		Ib::new_range(self.0.ns, self.0.db, &self.0.tb, self.0.ix)
 	}

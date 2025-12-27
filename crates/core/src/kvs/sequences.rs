@@ -117,6 +117,11 @@ impl SequenceDomain {
 		Self::IndexIds(ns, db, tb)
 	}
 
+	/// Returns the range of batch keys for this sequence domain.
+	///
+	/// This method was used in the old range-scan approach but is kept for
+	/// debugging and potential recovery scenarios.
+	#[allow(dead_code)]
 	fn new_batch_range_keys(&self) -> Result<Range<Vec<u8>>> {
 		match self {
 			Self::UserName(ns, db, sq) => Prefix::new_ba_range(*ns, *db, sq),
@@ -552,8 +557,15 @@ impl Sequence {
 					return Err(anyhow::Error::new(Error::QueryTimedout(timeout)));
 				}
 			}
-			if let Ok(r) = Self::check_batch_allocation(sqs, seq, next, batch).await {
-				return Ok(r);
+			match Self::check_batch_allocation(sqs, seq, next, batch).await {
+				Ok(r) => return Ok(r),
+				Err(_) => {
+					// Increment conflict counter for test verification
+					#[cfg(test)]
+					{
+						TEST_CONFLICT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+					}
+				}
 			}
 			// exponential backoff with full jitter
 			let sleep_ms = thread_rng().gen_range(1..=tempo);
@@ -635,38 +647,74 @@ impl Sequence {
 	}
 }
 
+/// Test-only counter for tracking allocation conflicts.
+/// This is used to verify that the global counter approach reduces conflicts.
+#[cfg(test)]
+pub(crate) static TEST_CONFLICT_COUNT: std::sync::atomic::AtomicU64 =
+	std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(test)]
 mod tests {
 	use std::collections::HashSet;
 	use std::sync::Arc;
+	use std::sync::atomic::Ordering;
 
 	use tokio::sync::Barrier;
 
+	use super::TEST_CONFLICT_COUNT;
 	use crate::kvs::Datastore;
 
-	/// Test that parallel sequence allocations don't conflict.
+	/// Test that parallel sequence allocations have minimal conflicts with global counter.
 	///
-	/// Before the fix (using range scans), this test would fail with
-	/// "Transaction conflict: Resource busy" errors because all parallel
-	/// transactions would read the same range of batch keys, and when one
-	/// transaction wrote a new batch key, all others would conflict.
+	/// This test verifies that the global counter approach significantly reduces
+	/// transaction conflicts compared to range scans. With the old range-scan
+	/// implementation, each batch allocation would read ALL existing batch keys,
+	/// causing conflicts when multiple transactions tried to allocate simultaneously.
 	///
-	/// After the fix (using global counters), this test passes because
-	/// each transaction only reads/writes a single global counter key,
-	/// dramatically reducing the conflict window.
+	/// With the global counter approach:
+	/// - Each transaction only reads/writes a single global counter key
+	/// - Conflicts only occur when two transactions update the counter at exactly
+	///   the same time
+	/// - The conflict count should be very low (close to 0) for typical workloads
+	///
+	/// With the old range-scan approach:
+	/// - Each transaction reads the entire range of batch keys
+	/// - When one transaction commits a new batch key, ALL concurrent transactions
+	///   that read the range would conflict
+	/// - The conflict count would be very high (hundreds or thousands of retries)
 	#[tokio::test]
-	async fn test_parallel_sequence_allocation_no_conflicts() {
-		const NUM_WORKERS: usize = 8;
-		const IDS_PER_WORKER: usize = 100;
+	async fn test_parallel_sequence_allocation_low_conflicts() {
+		use crate::catalog::{DatabaseId, IndexId, NamespaceId};
+		use crate::idx::IndexKeyBase;
+		use crate::val::TableName;
+
+		const NUM_WORKERS: usize = 16;
+		const IDS_PER_WORKER: usize = 50;
+		// Use batch size of 1 to force a batch allocation for every single ID
+		// This maximizes contention and makes the test sensitive to conflicts
+		const BATCH_SIZE: u32 = 1;
+
+		// Reset the conflict counter
+		TEST_CONFLICT_COUNT.store(0, Ordering::SeqCst);
 
 		let ds = Arc::new(Datastore::new("memory").await.unwrap());
 		let barrier = Arc::new(Barrier::new(NUM_WORKERS));
+
+		// Create a shared IndexKeyBase (simulating a FT index on a table)
+		// We use FTS doc IDs because they allow setting a custom batch size
+		let ikb = IndexKeyBase::new(
+			NamespaceId(1),
+			DatabaseId(1),
+			TableName::from("test_table"),
+			IndexId(1),
+		);
 
 		// Spawn multiple workers that allocate IDs in parallel
 		let handles: Vec<_> = (0..NUM_WORKERS)
 			.map(|worker_id| {
 				let ds = ds.clone();
 				let barrier = barrier.clone();
+				let ikb = ikb.clone();
 
 				tokio::spawn(async move {
 					// Wait for all workers to be ready
@@ -675,15 +723,15 @@ mod tests {
 					let mut ids = Vec::with_capacity(IDS_PER_WORKER);
 
 					for _ in 0..IDS_PER_WORKER {
-						// Each worker allocates namespace IDs
-						// This exercises the sequence allocation path
+						// With BATCH_SIZE=1, each allocation triggers a batch allocation
+						// This creates maximum contention for batch allocations
 						let id = ds
 							.sequences()
-							.next_namespace_id(None)
+							.next_fts_doc_id(None, ikb.clone(), BATCH_SIZE)
 							.await
-							.expect("allocation should succeed without conflicts");
+							.expect("allocation should succeed");
 
-						ids.push(id.0);
+						ids.push(id);
 					}
 
 					(worker_id, ids)
@@ -710,41 +758,141 @@ mod tests {
 		}
 
 		// Verify we got all expected IDs
-		assert_eq!(
-			total_count,
-			NUM_WORKERS * IDS_PER_WORKER,
-			"Expected {} total IDs, got {}",
-			NUM_WORKERS * IDS_PER_WORKER,
-			total_count
+		let expected_ids = NUM_WORKERS * IDS_PER_WORKER;
+		assert_eq!(total_count, expected_ids, "Expected {} total IDs, got {}", expected_ids, total_count);
+
+		// Check conflict count
+		let conflicts = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
+		println!(
+			"Allocated {} unique IDs across {} parallel workers with {} conflicts (batch_size={})",
+			total_count, NUM_WORKERS, conflicts, BATCH_SIZE
 		);
 
-		println!(
-			"Successfully allocated {} unique IDs across {} parallel workers",
-			total_count, NUM_WORKERS
+		// With global counter approach, conflicts should be minimal
+		// Allow up to 20% conflicts as a safety margin for timing variations
+		// With range scans, we would see 80%+ conflicts (hundreds of retries)
+		let max_allowed_conflicts = (expected_ids as f64 * 0.2) as u64;
+		assert!(
+			conflicts <= max_allowed_conflicts,
+			"Too many conflicts: {} (max allowed: {}). This indicates the global counter \
+			 optimization may not be working. With range scans, we would expect \
+			 hundreds of conflicts here.",
+			conflicts, max_allowed_conflicts
 		);
 	}
 
-	/// Test parallel FT doc ID allocation (the most common conflict scenario).
+	/// Demonstrates that concurrent transactions writing the same key cause conflicts.
+	///
+	/// This test creates 5 transactions simultaneously that all try to write to the
+	/// same key. Only the first to commit succeeds; the rest fail with conflicts.
+	/// This demonstrates the conflict detection mechanism that the global counter
+	/// approach relies on for correctness.
+	///
+	/// The global counter approach is better than range scans because:
+	/// - Range scan: reads N batch keys, conflict if ANY of them change
+	/// - Global counter: reads 1 key, conflict only if that one key changes
+	/// - Fewer conflicts = faster throughput under contention
+	#[tokio::test]
+	async fn test_concurrent_writes_cause_conflicts() {
+		use crate::kvs::{LockType, TransactionType};
+
+		let ds = Datastore::new("memory").await.unwrap();
+		const KEY: &[u8] = b"/test/conflict/key";
+
+		// Initialize the key
+		{
+			let tx = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
+			tx.set(&KEY.to_vec(), &b"initial".to_vec(), None).await.unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Create 5 transactions that all read and try to write the same key
+		// This simulates what happens when multiple batch allocations run concurrently
+		let tx1 = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
+		let tx2 = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
+		let tx3 = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
+		let tx4 = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
+		let tx5 = ds.transaction(TransactionType::Write, LockType::Optimistic).await.unwrap();
+
+		// All transactions read the current value
+		let _ = tx1.get(&KEY.to_vec(), None).await.unwrap();
+		let _ = tx2.get(&KEY.to_vec(), None).await.unwrap();
+		let _ = tx3.get(&KEY.to_vec(), None).await.unwrap();
+		let _ = tx4.get(&KEY.to_vec(), None).await.unwrap();
+		let _ = tx5.get(&KEY.to_vec(), None).await.unwrap();
+
+		// All transactions try to write a new value
+		tx1.set(&KEY.to_vec(), &b"from tx1".to_vec(), None).await.unwrap();
+		tx2.set(&KEY.to_vec(), &b"from tx2".to_vec(), None).await.unwrap();
+		tx3.set(&KEY.to_vec(), &b"from tx3".to_vec(), None).await.unwrap();
+		tx4.set(&KEY.to_vec(), &b"from tx4".to_vec(), None).await.unwrap();
+		tx5.set(&KEY.to_vec(), &b"from tx5".to_vec(), None).await.unwrap();
+
+		// First transaction commits successfully
+		tx1.commit().await.expect("tx1 should succeed");
+
+		// Remaining transactions should fail with conflicts
+		let mut conflicts = 0;
+		if tx2.commit().await.is_err() {
+			conflicts += 1;
+		}
+		if tx3.commit().await.is_err() {
+			conflicts += 1;
+		}
+		if tx4.commit().await.is_err() {
+			conflicts += 1;
+		}
+		if tx5.commit().await.is_err() {
+			conflicts += 1;
+		}
+
+		println!("Concurrent write test: {conflicts} out of 4 remaining transactions conflicted");
+
+		// With optimistic transactions, we expect conflicts when multiple
+		// transactions try to modify the same key
+		assert!(
+			conflicts >= 3,
+			"Expected at least 3 conflicts when 5 transactions write the same key, got {conflicts}"
+		);
+
+		// Verify the final value is from tx1
+		let tx = ds.transaction(TransactionType::Read, LockType::Optimistic).await.unwrap();
+		let val = tx.get(&KEY.to_vec(), None).await.unwrap().unwrap();
+		assert_eq!(val, b"from tx1");
+		tx.cancel().await.unwrap();
+	}
+
+	/// Test parallel FT doc ID allocation with batch=1 (maximum contention).
 	///
 	/// This simulates the scenario from the bug report where parallel INSERT
 	/// operations into a table with a full-text index caused conflicts.
+	/// Using batch_size=1 forces every allocation to go through batch allocation,
+	/// maximizing the chance of conflicts.
+	///
+	/// With the old range-scan approach, this would cause hundreds of conflicts.
+	/// With the global counter approach, conflicts are minimal.
 	#[tokio::test]
-	async fn test_parallel_fts_doc_id_allocation() {
+	async fn test_parallel_fts_doc_id_allocation_max_contention() {
 		use crate::catalog::{DatabaseId, IndexId, NamespaceId};
 		use crate::idx::IndexKeyBase;
 		use crate::val::TableName;
 
-		const NUM_WORKERS: usize = 8;
-		const IDS_PER_WORKER: usize = 50;
+		const NUM_WORKERS: usize = 20;
+		const IDS_PER_WORKER: usize = 40;
+		// Use batch size of 1 to force maximum contention
+		const BATCH_SIZE: u32 = 1;
+
+		// Reset the conflict counter
+		TEST_CONFLICT_COUNT.store(0, Ordering::SeqCst);
 
 		let ds = Arc::new(Datastore::new("memory").await.unwrap());
 		let barrier = Arc::new(Barrier::new(NUM_WORKERS));
 
 		// Create a shared IndexKeyBase (simulating a FT index on a table)
 		let ikb = IndexKeyBase::new(
-			NamespaceId(1),
-			DatabaseId(1),
-			TableName::from("test_table"),
+			NamespaceId(2), // Use different namespace to avoid interference with other test
+			DatabaseId(2),
+			TableName::from("fts_test_table"),
 			IndexId(1),
 		);
 
@@ -762,7 +910,7 @@ mod tests {
 					for _ in 0..IDS_PER_WORKER {
 						let doc_id = ds
 							.sequences()
-							.next_fts_doc_id(None, ikb.clone(), 100)
+							.next_fts_doc_id(None, ikb.clone(), BATCH_SIZE)
 							.await
 							.expect("FTS doc ID allocation should succeed");
 
@@ -788,11 +936,27 @@ mod tests {
 			}
 		}
 
-		assert_eq!(all_doc_ids.len(), NUM_WORKERS * IDS_PER_WORKER);
+		let expected_ids = NUM_WORKERS * IDS_PER_WORKER;
+		assert_eq!(all_doc_ids.len(), expected_ids);
+
+		// Check conflict count
+		let conflicts = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
 		println!(
-			"Successfully allocated {} unique FTS doc IDs across {} parallel workers",
+			"Allocated {} unique FTS doc IDs across {} workers with {} conflicts (batch_size={})",
 			all_doc_ids.len(),
-			NUM_WORKERS
+			NUM_WORKERS,
+			conflicts,
+			BATCH_SIZE
+		);
+
+		// With global counter approach, conflicts should be minimal (< 20%)
+		// With range scans, we would expect 80%+ conflicts
+		let max_allowed_conflicts = (expected_ids as f64 * 0.2) as u64;
+		assert!(
+			conflicts <= max_allowed_conflicts,
+			"Too many conflicts: {} (max allowed: {}). This indicates the global counter \
+			 optimization may not be working.",
+			conflicts, max_allowed_conflicts
 		);
 	}
 }

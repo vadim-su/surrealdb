@@ -745,17 +745,29 @@ mod tests {
 		assert_eq!(all_ids.len(), NUM_CONCURRENT_TASKS);
 
 		let conflicts = TEST_CONFLICT_COUNT.load(Ordering::SeqCst);
+		let conflict_rate = (conflicts as f64 / NUM_CONCURRENT_TASKS as f64) * 100.0;
 		println!(
 			"\n=== RocksDB Multi-node test ===\n\
 			 Concurrent tasks: {NUM_CONCURRENT_TASKS}\n\
 			 Conflicts: {conflicts}\n\
 			 Conflict rate: {:.1}%\n\
 			 ===============================",
-			(conflicts as f64 / NUM_CONCURRENT_TASKS as f64) * 100.0
+			conflict_rate
 		);
 
-		// With global counter approach, conflicts should be manageable
-		// The test mainly verifies no duplicate IDs are generated
+		// With global counter approach, conflict rate should be manageable (< 300%)
+		// With range-scan approach, conflict rate would be MUCH higher (> 500%)
+		// because every transaction reads ALL batch keys, causing conflicts
+		// whenever ANY other transaction adds a new batch key.
+		//
+		// This test SHOULD FAIL on main (range-scan) and PASS on this branch (global counter)
+		assert!(
+			conflict_rate < 300.0,
+			"Conflict rate too high: {:.1}%. With global counter approach, \
+			 we expect < 300% conflict rate. If you see > 500%, you're likely \
+			 running the old range-scan implementation which causes excessive conflicts.",
+			conflict_rate
+		);
 	}
 
 	/// Test with memory backend - verifies uniqueness of allocated IDs.

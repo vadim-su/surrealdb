@@ -671,22 +671,22 @@ mod tests {
 	use crate::kvs::Datastore;
 	use crate::val::TableName;
 
-	/// Performance test: measures allocation time with many existing batch keys.
+	/// Performance test: measures how allocation time scales with existing keys.
 	///
 	/// With range-scan: O(n) - time grows as batch keys accumulate
 	/// With global counter: O(1) - time stays constant
 	///
-	/// This test pre-populates the database with many batch keys, then measures
-	/// how long it takes to allocate new batches. The global counter approach
-	/// should be significantly faster.
+	/// This test compares allocation time with FEW keys vs MANY keys.
+	/// The ratio should be close to 1.0 with global counter, but high with range-scan.
 	#[cfg(feature = "kv-rocksdb")]
 	#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 	async fn test_batch_allocation_performance_rocksdb() {
 		use std::time::Instant;
 		use temp_dir::TempDir;
 
-		const PRE_POPULATE_KEYS: usize = 1000;
-		const ALLOCATIONS_TO_MEASURE: usize = 100;
+		const WARMUP_KEYS: usize = 10;
+		const MEASURE_ALLOCATIONS: usize = 50;
+		const KEYS_TO_ADD: usize = 1000;
 		const BATCH_SIZE: u32 = 1;
 
 		// Create RocksDB-backed storage
@@ -708,48 +708,64 @@ mod tests {
 
 		let sequences = Sequences::new(tf.clone(), Uuid::new_v4());
 
-		// Phase 1: Pre-populate with many batch keys
-		println!("\n=== Performance Test ===");
-		println!("Pre-populating with {PRE_POPULATE_KEYS} batch keys...");
+		println!("\n=== Performance Scaling Test ===");
 
-		let prepopulate_start = Instant::now();
-		for _ in 0..PRE_POPULATE_KEYS {
+		// Phase 1: Warmup with few keys
+		for _ in 0..WARMUP_KEYS {
 			sequences
 				.next_fts_doc_id(None, ikb.clone(), BATCH_SIZE)
 				.await
-				.expect("pre-populate should succeed");
+				.expect("warmup should succeed");
 		}
-		let prepopulate_time = prepopulate_start.elapsed();
-		println!("Pre-populate time: {:?}", prepopulate_time);
 
-		// Phase 2: Measure allocation time with many existing keys
-		println!("Measuring {ALLOCATIONS_TO_MEASURE} allocations with {PRE_POPULATE_KEYS} existing keys...");
-
-		let measure_start = Instant::now();
-		for _ in 0..ALLOCATIONS_TO_MEASURE {
+		// Phase 2: Measure with FEW existing keys
+		let start_few = Instant::now();
+		for _ in 0..MEASURE_ALLOCATIONS {
 			sequences
 				.next_fts_doc_id(None, ikb.clone(), BATCH_SIZE)
 				.await
 				.expect("allocation should succeed");
 		}
-		let measure_time = measure_start.elapsed();
+		let time_few = start_few.elapsed();
+		let avg_few_us = time_few.as_micros() as f64 / MEASURE_ALLOCATIONS as f64;
 
-		let avg_time_us = measure_time.as_micros() as f64 / ALLOCATIONS_TO_MEASURE as f64;
-		println!("Total time for {ALLOCATIONS_TO_MEASURE} allocations: {:?}", measure_time);
-		println!("Average time per allocation: {:.1} µs", avg_time_us);
-		println!("========================\n");
+		println!("With ~{} existing keys: {:.1} µs/allocation", WARMUP_KEYS + MEASURE_ALLOCATIONS, avg_few_us);
 
-		// With global counter (O(1)), average should be < 5000 µs (5ms)
-		// With range-scan (O(n)), average would be much higher with 1000 keys
-		//
-		// This threshold is generous to account for CI variability
+		// Phase 3: Add many more keys
+		for _ in 0..KEYS_TO_ADD {
+			sequences
+				.next_fts_doc_id(None, ikb.clone(), BATCH_SIZE)
+				.await
+				.expect("populate should succeed");
+		}
+
+		// Phase 4: Measure with MANY existing keys
+		let total_keys = WARMUP_KEYS + MEASURE_ALLOCATIONS + KEYS_TO_ADD;
+		let start_many = Instant::now();
+		for _ in 0..MEASURE_ALLOCATIONS {
+			sequences
+				.next_fts_doc_id(None, ikb.clone(), BATCH_SIZE)
+				.await
+				.expect("allocation should succeed");
+		}
+		let time_many = start_many.elapsed();
+		let avg_many_us = time_many.as_micros() as f64 / MEASURE_ALLOCATIONS as f64;
+
+		println!("With ~{} existing keys: {:.1} µs/allocation", total_keys, avg_many_us);
+
+		let slowdown_ratio = avg_many_us / avg_few_us;
+		println!("Slowdown ratio: {:.2}x", slowdown_ratio);
+		println!("================================\n");
+
+		// With global counter (O(1)), ratio should be close to 1.0 (< 3.0)
+		// With range-scan (O(n)), ratio would be much higher (> 5.0)
+		// because scanning 1000+ keys takes much longer than scanning 10 keys
 		assert!(
-			avg_time_us < 5000.0,
-			"Average allocation time too high: {:.1} µs. \
-			 With global counter approach (O(1)), we expect < 5000 µs per allocation. \
-			 If you see much higher values, you're likely running the old range-scan \
-			 implementation which is O(n) where n = number of existing batch keys.",
-			avg_time_us
+			slowdown_ratio < 3.0,
+			"Performance degradation too high: {:.2}x slowdown. \
+			 With global counter approach (O(1)), we expect < 3.0x slowdown. \
+			 With range-scan (O(n)), you would see > 5x slowdown as keys accumulate.",
+			slowdown_ratio
 		);
 	}
 

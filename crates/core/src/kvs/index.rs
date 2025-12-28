@@ -19,7 +19,8 @@ use wasm_bindgen_futures::spawn_local as spawn;
 
 use crate::catalog::providers::TableProvider;
 use crate::catalog::{
-	DatabaseDefinition, DatabaseId, IndexDefinition, IndexId, NamespaceId, Record, TableId,
+	DatabaseDefinition, DatabaseId, FullTextParams, Index, IndexDefinition, IndexId, NamespaceId,
+	Record, TableId,
 };
 use crate::cnf::{INDEXING_BATCH_SIZE, NORMAL_FETCH_SIZE};
 use crate::ctx::{Context, FrozenContext};
@@ -345,6 +346,9 @@ struct Building {
 	queue: Arc<RwLock<QueueSequences>>,
 	aborted: AtomicBool,
 	finished: AtomicBool,
+	/// Cached FullTextIndex for bulk indexing optimization.
+	/// Avoids recreating the index for each document.
+	cached_fti: RwLock<Option<FullTextIndex>>,
 }
 
 impl Building {
@@ -372,6 +376,7 @@ impl Building {
 			queue: Default::default(),
 			aborted: AtomicBool::new(false),
 			finished: AtomicBool::new(false),
+			cached_fti: RwLock::new(None),
 		})
 	}
 
@@ -381,6 +386,41 @@ impl Building {
 		if !s.is_error() {
 			*s = status;
 		}
+	}
+
+	/// Get or create a cached FullTextIndex for bulk indexing.
+	/// This avoids recreating the index for each document, significantly
+	/// improving bulk indexing performance.
+	async fn get_or_create_fti(
+		&self,
+		ctx: &FrozenContext,
+		p: &FullTextParams,
+	) -> Result<tokio::sync::RwLockReadGuard<'_, Option<FullTextIndex>>> {
+		// First, check if we already have a cached FTI
+		{
+			let guard = self.cached_fti.read().await;
+			if guard.is_some() {
+				return Ok(guard);
+			}
+		}
+
+		// Need to create the FTI - acquire write lock
+		let mut guard = self.cached_fti.write().await;
+		// Double-check after acquiring write lock
+		if guard.is_none() {
+			let fti = FullTextIndex::new(
+				ctx.get_index_stores(),
+				&ctx.tx(),
+				self.ikb.clone(),
+				p,
+			)
+			.await?;
+			*guard = Some(fti);
+		}
+		drop(guard);
+
+		// Return read guard
+		Ok(self.cached_fti.read().await)
 	}
 
 	async fn maybe_consume(
@@ -582,6 +622,15 @@ impl Building {
 	) -> Result<()> {
 		let mut rc = false;
 		let mut stack = TreeStack::new();
+
+		// For fulltext indexes, get or create cached FTI to avoid recreating it per document
+		let cached_fti_guard = if let Index::FullText(p) = &self.ix.index {
+			Some(self.get_or_create_fti(ctx, p).await?)
+		} else {
+			None
+		};
+		let cached_fti = cached_fti_guard.as_ref().and_then(|g| g.as_ref());
+
 		// Index the records
 		for (k, v) in values {
 			if self.is_aborted().await {
@@ -619,8 +668,8 @@ impl Building {
 					.await?;
 			}
 
-			// Index the record
-			let mut io = IndexOperation::new(
+			// Index the record - use cached FTI if available
+			let io = IndexOperation::new(
 				ctx,
 				&self.opt,
 				self.ns,
@@ -631,6 +680,11 @@ impl Building {
 				opt_values.clone(),
 				&rid,
 			);
+			let mut io = if let Some(fti) = cached_fti {
+				io.with_cached_fti(fti)
+			} else {
+				io
+			};
 			stack.enter(|stk| io.compute(stk, &mut rc)).finish().await?;
 
 			// Increment the count and update the status
@@ -658,6 +712,15 @@ impl Building {
 	) -> Result<()> {
 		let mut rc = false;
 		let mut stack = TreeStack::new();
+
+		// For fulltext indexes, get or create cached FTI to avoid recreating it per document
+		let cached_fti_guard = if let Index::FullText(p) = &self.ix.index {
+			Some(self.get_or_create_fti(ctx, p).await?)
+		} else {
+			None
+		};
+		let cached_fti = cached_fti_guard.as_ref().and_then(|g| g.as_ref());
+
 		for i in range {
 			if self.is_aborted().await {
 				return Ok(());
@@ -670,7 +733,7 @@ impl Building {
 					table: self.ikb.table().clone(),
 					key: a.id,
 				};
-				let mut io = IndexOperation::new(
+				let io = IndexOperation::new(
 					ctx,
 					&self.opt,
 					self.ns,
@@ -681,6 +744,11 @@ impl Building {
 					a.new_values,
 					&rid,
 				);
+				let mut io = if let Some(fti) = cached_fti {
+					io.with_cached_fti(fti)
+				} else {
+					io
+				};
 				stack.enter(|stk| io.compute(stk, &mut rc)).finish().await?;
 
 				// We can delete the ip record if any

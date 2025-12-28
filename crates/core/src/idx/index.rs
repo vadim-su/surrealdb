@@ -46,6 +46,8 @@ pub(crate) struct IndexOperation<'a> {
 	/// The new values (if existing)
 	n: Option<Vec<Value>>,
 	rid: &'a RecordId,
+	/// Optional cached FullTextIndex for bulk indexing optimization
+	cached_fti: Option<&'a FullTextIndex>,
 }
 
 impl<'a> IndexOperation<'a> {
@@ -72,7 +74,15 @@ impl<'a> IndexOperation<'a> {
 			o,
 			n,
 			rid,
+			cached_fti: None,
 		}
+	}
+
+	/// Set a cached FullTextIndex to avoid recreating it for each document.
+	/// This significantly improves bulk indexing performance.
+	pub(crate) fn with_cached_fti(mut self, fti: &'a FullTextIndex) -> Self {
+		self.cached_fti = Some(fti);
+		self
 	}
 
 	pub(crate) async fn compute(
@@ -263,10 +273,22 @@ impl<'a> IndexOperation<'a> {
 		require_compaction: &mut bool,
 	) -> Result<()> {
 		let mut rc = false;
-		// Build a FullText instance
-		let fti =
-			FullTextIndex::new(self.ctx.get_index_stores(), &self.ctx.tx(), self.ikb.clone(), p)
-				.await?;
+
+		// Use cached FTI if available, otherwise create a new one
+		let owned_fti;
+		let fti: &FullTextIndex = if let Some(cached) = self.cached_fti {
+			cached
+		} else {
+			owned_fti = FullTextIndex::new(
+				self.ctx.get_index_stores(),
+				&self.ctx.tx(),
+				self.ikb.clone(),
+				p,
+			)
+			.await?;
+			&owned_fti
+		};
+
 		// Delete the old index data
 		let doc_id = if let Some(o) = self.o.take() {
 			fti.remove_content(stk, self.ctx, self.opt, self.rid, o, &mut rc).await?

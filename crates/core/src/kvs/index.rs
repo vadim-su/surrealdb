@@ -620,25 +620,23 @@ impl Building {
 		values: Vec<(Key, Val)>,
 		count: &mut usize,
 	) -> Result<()> {
+		// For fulltext indexes, use optimized batch indexing
+		if let Index::FullText(_) = &self.ix.index {
+			return self
+				.index_initial_batch_fulltext(ctx, tx, values, count)
+				.await;
+		}
+
+		// For other index types, use the standard per-document approach
 		let mut rc = false;
 		let mut stack = TreeStack::new();
 
-		// For fulltext indexes, get or create cached FTI to avoid recreating it per document
-		let cached_fti_guard = if let Index::FullText(p) = &self.ix.index {
-			Some(self.get_or_create_fti(ctx, p).await?)
-		} else {
-			None
-		};
-		let cached_fti = cached_fti_guard.as_ref().and_then(|g| g.as_ref());
-
-		// Index the records
 		for (k, v) in values {
 			if self.is_aborted().await {
 				return Ok(());
 			}
 			self.is_beyond_threshold(Some(*count))?;
 			let key = record::RecordKey::decode_key(&k)?;
-			// Parse the value
 			let val = Record::kv_decode_value(v)?;
 			let rid: Arc<RecordId> = RecordId {
 				table: key.tb.into_owned(),
@@ -647,12 +645,8 @@ impl Building {
 			.into();
 
 			let opt_values;
-
-			// Do we already have an appended value?
 			let ip = self.ikb.new_ip_key(rid.key.clone());
 			if let Some(pa) = tx.get(&ip, None).await? {
-				// Then we take the old value of the appending value as the initial indexing
-				// value
 				let ia = self.ikb.new_ia_key(pa.0);
 				let a = tx
 					.get(&ia, None)
@@ -660,7 +654,6 @@ impl Building {
 					.ok_or_else(|| Error::CorruptedIndex("Appending record is missing"))?;
 				opt_values = a.old_values;
 			} else {
-				// Otherwise, we normally proceed to the indexing
 				let doc = CursorDoc::new(Some(rid.clone()), None, val);
 				opt_values = stack
 					.enter(|stk| Document::build_opt_values(stk, ctx, &self.opt, &self.ix, &doc))
@@ -668,8 +661,7 @@ impl Building {
 					.await?;
 			}
 
-			// Index the record - use cached FTI if available
-			let io = IndexOperation::new(
+			let mut io = IndexOperation::new(
 				ctx,
 				&self.opt,
 				self.ns,
@@ -680,14 +672,8 @@ impl Building {
 				opt_values.clone(),
 				&rid,
 			);
-			let mut io = if let Some(fti) = cached_fti {
-				io.with_cached_fti(fti)
-			} else {
-				io
-			};
 			stack.enter(|stk| io.compute(stk, &mut rc)).finish().await?;
 
-			// Increment the count and update the status
 			*count += 1;
 			self.set_status(BuildingStatus::Indexing {
 				initial: Some(*count),
@@ -696,9 +682,91 @@ impl Building {
 			})
 			.await;
 		}
-		// Check if we trigger the compaction
 		self.check_index_compaction(tx, &mut rc).await?;
-		// We're done
+		Ok(())
+	}
+
+	/// Optimized batch indexing for fulltext indexes.
+	/// Collects all documents and indexes them in a single batch operation.
+	async fn index_initial_batch_fulltext(
+		&self,
+		ctx: &FrozenContext,
+		tx: &Transaction,
+		values: Vec<(Key, Val)>,
+		count: &mut usize,
+	) -> Result<()> {
+		let mut stack = TreeStack::new();
+
+		// Get or create the cached FTI
+		let Index::FullText(p) = &self.ix.index else {
+			unreachable!()
+		};
+		let cached_fti_guard = self.get_or_create_fti(ctx, p).await?;
+		let fti = cached_fti_guard
+			.as_ref()
+			.ok_or_else(|| Error::Internal("FTI not initialized".into()))?;
+
+		// Collect all documents for batch indexing
+		let mut documents: Vec<(Arc<RecordId>, Vec<Value>)> = Vec::with_capacity(values.len());
+
+		for (k, v) in values {
+			if self.is_aborted().await {
+				return Ok(());
+			}
+			self.is_beyond_threshold(Some(*count))?;
+
+			let key = record::RecordKey::decode_key(&k)?;
+			let val = Record::kv_decode_value(v)?;
+			let rid: Arc<RecordId> = RecordId {
+				table: key.tb.into_owned(),
+				key: key.id,
+			}
+			.into();
+
+			// Check for appended values
+			let ip = self.ikb.new_ip_key(rid.key.clone());
+			let opt_values = if let Some(pa) = tx.get(&ip, None).await? {
+				let ia = self.ikb.new_ia_key(pa.0);
+				let a = tx
+					.get(&ia, None)
+					.await?
+					.ok_or_else(|| Error::CorruptedIndex("Appending record is missing"))?;
+				a.old_values
+			} else {
+				let doc = CursorDoc::new(Some(rid.clone()), None, val);
+				stack
+					.enter(|stk| Document::build_opt_values(stk, ctx, &self.opt, &self.ix, &doc))
+					.finish()
+					.await?
+			};
+
+			// Collect documents that have values to index
+			if let Some(values) = opt_values {
+				documents.push((rid, values));
+			}
+
+			*count += 1;
+		}
+
+		// Batch index all collected documents
+		if !documents.is_empty() {
+			stack
+				.enter(|stk| fti.index_content_batch(stk, ctx, &self.opt, &documents))
+				.finish()
+				.await?;
+		}
+
+		// Update status
+		self.set_status(BuildingStatus::Indexing {
+			initial: Some(*count),
+			pending: Some(self.queue.read().await.pending() as usize),
+			updated: None,
+		})
+		.await;
+
+		// Trigger compaction for fulltext index
+		FullTextIndex::trigger_compaction(&self.ikb, tx, self.opt.id()).await?;
+
 		Ok(())
 	}
 

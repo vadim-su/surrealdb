@@ -126,6 +126,173 @@ pub(crate) struct Bm25Params {
 	pub(in crate::idx) b: f32,
 }
 
+/// Batch accumulator for bulk fulltext indexing.
+/// Collects all writes and flushes them efficiently.
+pub(crate) struct TermBatch {
+	/// Term-document writes: (term, doc_id) -> TermDocument
+	td_writes: HashMap<(String, DocId), TermDocument>,
+	/// Term transaction log entries: (term, doc_id)
+	/// We only track unique (term, doc_id) pairs; the actual tt keys
+	/// with UUIDs are generated during flush
+	tt_entries: HashSet<(String, DocId)>,
+	/// DLE chunk updates: chunk_id -> chunk_data
+	/// Multiple doc_ids can map to the same chunk
+	dle_chunks: HashMap<u64, Vec<u8>>,
+	/// Accumulated document length and count
+	total_doc_length: u64,
+	doc_count: u64,
+	/// Whether we're using accurate scoring (legacy dl keys vs DLE chunks)
+	use_accurate_scoring: bool,
+	/// Legacy dl writes for accurate scoring: doc_id -> doc_length
+	dl_writes: HashMap<DocId, DocLength>,
+}
+
+impl TermBatch {
+	/// Create a new batch accumulator
+	pub fn new(use_accurate_scoring: bool) -> Self {
+		Self {
+			td_writes: HashMap::new(),
+			tt_entries: HashSet::new(),
+			dle_chunks: HashMap::new(),
+			total_doc_length: 0,
+			doc_count: 0,
+			use_accurate_scoring,
+			dl_writes: HashMap::new(),
+		}
+	}
+
+	/// Add a document's terms to the batch (without offsets)
+	pub fn add_document_terms(
+		&mut self,
+		doc_id: DocId,
+		doc_length: DocLength,
+		term_frequencies: HashMap<&str, TermFrequency>,
+	) {
+		// Accumulate term-document entries
+		for (term, freq) in term_frequencies {
+			let key = (term.to_string(), doc_id);
+			self.td_writes.insert(
+				key.clone(),
+				TermDocument {
+					f: freq,
+					o: Vec::new(),
+				},
+			);
+			self.tt_entries.insert(key);
+		}
+
+		// Track document length
+		self.total_doc_length += doc_length;
+		self.doc_count += 1;
+
+		if self.use_accurate_scoring {
+			// Legacy format
+			self.dl_writes.insert(doc_id, doc_length);
+		} else {
+			// DLE chunk format
+			let encoded = SmallFloat::encode(doc_length as u32);
+			let chunk_id = Dle::chunk_id(doc_id);
+			let offset = Dle::offset(doc_id);
+
+			let chunk = self
+				.dle_chunks
+				.entry(chunk_id)
+				.or_insert_with(|| vec![0u8; CHUNK_SIZE as usize]);
+			chunk[offset] = encoded;
+		}
+	}
+
+	/// Add a document's terms with offsets to the batch
+	fn add_document_terms_with_offsets(
+		&mut self,
+		doc_id: DocId,
+		doc_length: DocLength,
+		term_offsets: HashMap<&str, Vec<Offset>>,
+	) {
+		// Accumulate term-document entries with offsets
+		for (term, offsets) in term_offsets {
+			let key = (term.to_string(), doc_id);
+			self.td_writes.insert(
+				key.clone(),
+				TermDocument {
+					f: offsets.len() as TermFrequency,
+					o: offsets,
+				},
+			);
+			self.tt_entries.insert(key);
+		}
+
+		// Track document length
+		self.total_doc_length += doc_length;
+		self.doc_count += 1;
+
+		if self.use_accurate_scoring {
+			self.dl_writes.insert(doc_id, doc_length);
+		} else {
+			let encoded = SmallFloat::encode(doc_length as u32);
+			let chunk_id = Dle::chunk_id(doc_id);
+			let offset = Dle::offset(doc_id);
+
+			let chunk = self
+				.dle_chunks
+				.entry(chunk_id)
+				.or_insert_with(|| vec![0u8; CHUNK_SIZE as usize]);
+			chunk[offset] = encoded;
+		}
+	}
+
+	/// Flush all accumulated writes to the transaction
+	pub async fn flush(
+		self,
+		tx: &Transaction,
+		ikb: &IndexKeyBase,
+		nid: Uuid,
+	) -> Result<()> {
+		// 1. Write all term-document entries
+		for ((term, doc_id), td) in self.td_writes {
+			let key = ikb.new_td(&term, doc_id);
+			tx.set(&key, &td, None).await?;
+		}
+
+		// 2. Write all term transaction log entries
+		for (term, doc_id) in self.tt_entries {
+			let key = ikb.new_tt(&term, doc_id, nid, Uuid::now_v7(), true);
+			tx.set(&key, &String::new(), None).await?;
+		}
+
+		// 3. Write DLE chunks (merged updates)
+		for (chunk_id, chunk_data) in self.dle_chunks {
+			let key = ikb.new_dle(chunk_id);
+			// Read existing chunk and merge
+			let mut existing = tx.get(&key, None).await?.unwrap_or_else(|| vec![0u8; CHUNK_SIZE as usize]);
+			for (i, &byte) in chunk_data.iter().enumerate() {
+				if byte != 0 {
+					existing[i] = byte;
+				}
+			}
+			tx.set(&key, &existing, None).await?;
+		}
+
+		// 4. Write legacy dl keys for accurate scoring
+		for (doc_id, doc_length) in self.dl_writes {
+			let key = ikb.new_dl(doc_id);
+			tx.set(&key, &doc_length, None).await?;
+		}
+
+		// 5. Write single DocLengthAndCount delta for all documents
+		if self.doc_count > 0 {
+			let key = ikb.new_dc_with_id(0, nid, Uuid::now_v7());
+			let dcl = DocLengthAndCount {
+				total_docs_length: self.total_doc_length as i128,
+				doc_count: self.doc_count as i64,
+			};
+			tx.put(&key, &dcl, None).await?;
+		}
+
+		Ok(())
+	}
+}
+
 /// The main full-text index implementation that supports concurrent read and
 /// write operations
 pub(crate) struct FullTextIndex {
@@ -348,6 +515,52 @@ impl FullTextIndex {
 			*require_compaction = true;
 		}
 		// We're done
+		Ok(())
+	}
+
+	/// Batch index multiple documents efficiently.
+	/// This method accumulates all writes and flushes them at once,
+	/// significantly reducing the number of individual KV operations.
+	pub(crate) async fn index_content_batch(
+		&self,
+		stk: &mut Stk,
+		ctx: &FrozenContext,
+		opt: &Options,
+		documents: &[(Arc<RecordId>, Vec<Value>)],
+	) -> Result<()> {
+		if documents.is_empty() {
+			return Ok(());
+		}
+
+		let tx = ctx.tx();
+		let nid = opt.id();
+		let mut batch = TermBatch::new(self.use_accurate_scoring);
+
+		// Process all documents and accumulate writes
+		for (rid, content) in documents {
+			// Resolve doc_id
+			let id = self.doc_ids.resolve_doc_id(ctx, rid.key.clone()).await?;
+			let doc_id = id.doc_id();
+
+			// Tokenize content
+			let tokens = self
+				.analyzer
+				.analyze_content(stk, ctx, opt, content.clone(), FilteringStage::Indexing)
+				.await?;
+
+			// Extract terms and add to batch
+			if self.highlighting {
+				let (dl, offsets) = Analyzer::extract_offsets(&tokens)?;
+				batch.add_document_terms_with_offsets(doc_id, dl, offsets);
+			} else {
+				let (dl, tf) = Analyzer::extract_frequencies(&tokens)?;
+				batch.add_document_terms(doc_id, dl, tf);
+			}
+		}
+
+		// Flush all accumulated writes at once
+		batch.flush(&tx, &self.ikb, nid).await?;
+
 		Ok(())
 	}
 

@@ -248,45 +248,58 @@ impl TermBatch {
 		ikb: &IndexKeyBase,
 		nid: Uuid,
 	) -> Result<()> {
-		// 1. Write all term-document entries
+		use crate::kvs::{KVKey, KVValue};
+
+		// Collect all entries that can be written in a single batch
+		let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(
+			self.td_writes.len() + self.tt_entries.len() + self.dl_writes.len() + 1,
+		);
+
+		// 1. Term-document entries
 		for ((term, doc_id), td) in self.td_writes {
 			let key = ikb.new_td(&term, doc_id);
-			tx.set(&key, &td, None).await?;
+			entries.push((key.encode_key()?, td.kv_encode_value()?));
 		}
 
-		// 2. Write all term transaction log entries
+		// 2. Term transaction log entries
 		for (term, doc_id) in self.tt_entries {
 			let key = ikb.new_tt(&term, doc_id, nid, Uuid::now_v7(), true);
-			tx.set(&key, &String::new(), None).await?;
+			entries.push((key.encode_key()?, String::new().kv_encode_value()?));
 		}
 
-		// 3. Write DLE chunks (merged updates)
-		for (chunk_id, chunk_data) in self.dle_chunks {
-			let key = ikb.new_dle(chunk_id);
-			// Read existing chunk and merge
-			let mut existing = tx.get(&key, None).await?.unwrap_or_else(|| vec![0u8; CHUNK_SIZE as usize]);
-			for (i, &byte) in chunk_data.iter().enumerate() {
-				if byte != 0 {
-					existing[i] = byte;
-				}
-			}
-			tx.set(&key, &existing, None).await?;
-		}
-
-		// 4. Write legacy dl keys for accurate scoring
+		// 3. Legacy dl keys for accurate scoring
 		for (doc_id, doc_length) in self.dl_writes {
 			let key = ikb.new_dl(doc_id);
-			tx.set(&key, &doc_length, None).await?;
+			entries.push((key.encode_key()?, doc_length.kv_encode_value()?));
 		}
 
-		// 5. Write single DocLengthAndCount delta for all documents
+		// 4. DocLengthAndCount delta
 		if self.doc_count > 0 {
 			let key = ikb.new_dc_with_id(0, nid, Uuid::now_v7());
 			let dcl = DocLengthAndCount {
 				total_docs_length: self.total_doc_length as i128,
 				doc_count: self.doc_count as i64,
 			};
-			tx.put(&key, &dcl, None).await?;
+			entries.push((key.encode_key()?, dcl.kv_encode_value()?));
+		}
+
+		// Write all entries in a single batch (bypasses conflict checking for RocksDB)
+		if !entries.is_empty() {
+			tx.batch_write(entries).await?;
+		}
+
+		// 5. DLE chunks require read-modify-write, must be done separately
+		for (chunk_id, chunk_data) in self.dle_chunks {
+			let key = ikb.new_dle(chunk_id);
+			// Read existing chunk and merge
+			let mut existing =
+				tx.get(&key, None).await?.unwrap_or_else(|| vec![0u8; CHUNK_SIZE as usize]);
+			for (i, &byte) in chunk_data.iter().enumerate() {
+				if byte != 0 {
+					existing[i] = byte;
+				}
+			}
+			tx.set(&key, &existing, None).await?;
 		}
 
 		Ok(())

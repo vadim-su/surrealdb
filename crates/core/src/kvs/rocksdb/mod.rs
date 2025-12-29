@@ -17,7 +17,7 @@ use disk_space_manager::{DiskSpaceManager, DiskSpaceState, TransactionState};
 use memory_manager::MemoryManager;
 use rocksdb::{
 	DBCompactionStyle, DBCompressionType, FlushOptions, LogLevel, OptimisticTransactionDB,
-	OptimisticTransactionOptions, Options, ReadOptions, WriteOptions,
+	OptimisticTransactionOptions, Options, ReadOptions, WriteBatchWithTransaction, WriteOptions,
 };
 use tokio::sync::Mutex;
 
@@ -915,6 +915,39 @@ impl Transactable for Transaction {
 
 	/// Release the last save point.
 	async fn release_last_save_point(&self) -> Result<()> {
+		Ok(())
+	}
+
+	/// Write multiple key-value pairs atomically using WriteBatch.
+	///
+	/// This bypasses the transaction's conflict checking and writes directly
+	/// to the database. Use only when you have exclusive access to the keys
+	/// being written (e.g., during bulk index building).
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self, entries))]
+	async fn batch_write(&self, entries: Vec<(Key, Val)>) -> Result<()> {
+		// Check to see if transaction is closed
+		if self.closed() {
+			return Err(Error::TransactionFinished);
+		}
+		// Check to see if transaction is writable
+		if !self.writeable() {
+			return Err(Error::TransactionReadonly);
+		}
+		// Check if we are in read-and-deletion-only mode
+		if self.is_restricted(false) {
+			return Err(Error::ReadAndDeleteOnly);
+		}
+		// Create a WriteBatch and add all entries
+		let mut batch = WriteBatchWithTransaction::<true>::default();
+		for (key, val) in entries {
+			batch.put(key, val);
+		}
+		// Write the batch directly to the database, bypassing transaction conflict checking
+		self.db.write(batch)?;
+		// If we have a coordinator, wait for the grouped fsync
+		if let Some(coordinator) = &self.commit_coordinator {
+			coordinator.wait_for_sync().await?;
+		}
 		Ok(())
 	}
 

@@ -308,6 +308,18 @@ impl Transaction {
 		Ok(self.tr.set(key, val, version).await.map_err(Error::from)?)
 	}
 
+	/// Write multiple key-value pairs atomically.
+	///
+	/// This function writes all key-value pairs in a single atomic operation.
+	/// For backends that support it (like RocksDB), this bypasses conflict
+	/// checking for better performance during bulk operations.
+	///
+	/// Note: This method takes raw byte vectors - caller is responsible for encoding.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
+	pub async fn batch_write(&self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+		Ok(self.tr.batch_write(entries).await.map_err(Error::from)?)
+	}
+
 	/// Insert a key if it doesn't exist in the datastore.
 	#[instrument(level = "trace", target = "surrealdb::core::kvs::tx", skip_all)]
 	pub async fn put<K>(&self, key: &K, val: &K::ValueType, version: Option<u64>) -> Result<()>

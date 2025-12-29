@@ -434,6 +434,16 @@ impl Transactor {
 		self.inner.batch_keys(beg..end, batch, version).await
 	}
 
+	/// Write multiple key-value pairs atomically.
+	///
+	/// This function writes all key-value pairs in a single atomic operation.
+	/// For backends that support it (like RocksDB), this bypasses conflict
+	/// checking for better performance during bulk operations.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::tr", skip_all)]
+	pub async fn batch_write(&self, entries: Vec<(Key, Val)>) -> Result<()> {
+		self.inner.batch_write(entries).await
+	}
+
 	/// Retrieve a batched scan over a specific range of keys in the datastore.
 	///
 	/// This function fetches key-value pairs, in batches, with multiple

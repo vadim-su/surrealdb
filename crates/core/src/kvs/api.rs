@@ -478,6 +478,34 @@ pub trait Transactable: requirements::TransactionRequirements {
 	}
 
 	// --------------------------------------------------
+	// Batch write functions
+	// --------------------------------------------------
+
+	/// Write multiple key-value pairs atomically.
+	///
+	/// This function writes all key-value pairs in a single atomic operation.
+	/// For backends that support it (like RocksDB), this can bypass conflict
+	/// checking for better performance during bulk operations.
+	///
+	/// The default implementation simply calls `set` for each entry.
+	#[instrument(level = "trace", target = "surrealdb::core::kvs::api", skip(self, entries))]
+	async fn batch_write(&self, entries: Vec<(Key, Val)>) -> Result<()> {
+		// Check to see if transaction is closed
+		if self.closed() {
+			return Err(Error::TransactionFinished);
+		}
+		// Check to see if transaction is writable
+		if !self.writeable() {
+			return Err(Error::TransactionReadonly);
+		}
+		// Default implementation: write each entry individually
+		for (key, val) in entries {
+			self.set(key, val, None).await?;
+		}
+		Ok(())
+	}
+
+	// --------------------------------------------------
 	// Savepoint functions
 	// --------------------------------------------------
 

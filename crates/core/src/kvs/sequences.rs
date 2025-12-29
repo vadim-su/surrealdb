@@ -259,6 +259,35 @@ impl Sequences {
 		s.lock().await.next(self, ctx, &seq, batch).await
 	}
 
+	/// Allocates N sequential values at once, returning the starting value.
+	///
+	/// This is an optimized version of `next_val` that allocates multiple values
+	/// in a single operation, avoiding the overhead of individual allocations.
+	async fn next_n_vals(
+		&self,
+		ctx: Option<&Context>,
+		seq: Arc<SequenceDomain>,
+		start: i64,
+		count: usize,
+		batch: u32,
+		timeout: Option<Duration>,
+	) -> Result<i64> {
+		let sequence = self.sequences.read().await.get(&seq).cloned();
+		if let Some(s) = sequence {
+			return s.lock().await.next_n(self, ctx, &seq, count, batch).await;
+		}
+		let s = match self.sequences.write().await.entry(seq.clone()) {
+			Entry::Occupied(e) => e.get().clone(),
+			Entry::Vacant(e) => {
+				let s = Arc::new(Mutex::new(
+					Sequence::load(ctx, self, &seq, start, batch, timeout).await?,
+				));
+				e.insert(s).clone()
+			}
+		};
+		s.lock().await.next_n(self, ctx, &seq, count, batch).await
+	}
+
 	/// Generates the next namespace ID.
 	///
 	/// # Arguments
@@ -375,6 +404,31 @@ impl Sequences {
 		let id = self.next_val(ctx, domain, 0, batch, None).await?;
 		Ok(id as DocId)
 	}
+
+	/// Allocates multiple document IDs for a full-text search index at once.
+	///
+	/// This is an optimized method for bulk operations that allocates N IDs
+	/// in a single operation, avoiding the overhead of individual allocations.
+	///
+	/// # Arguments
+	/// * `ctx` - Optional mutable context for transaction operations
+	/// * `ikb` - The index key base identifying the full-text index
+	/// * `count` - The number of IDs to allocate
+	/// * `batch` - The batch size for underlying batch allocation
+	///
+	/// # Returns
+	/// A range of document IDs [start, start + count)
+	pub(crate) async fn allocate_fts_doc_ids(
+		&self,
+		ctx: Option<&Context>,
+		ikb: IndexKeyBase,
+		count: usize,
+		batch: u32,
+	) -> Result<Range<DocId>> {
+		let domain = Arc::new(SequenceDomain::new_ft_doc_ids(ikb));
+		let start = self.next_n_vals(ctx, domain, 0, count, batch, None).await?;
+		Ok(start as DocId..(start + count as i64) as DocId)
+	}
 }
 
 /// Internal per-node sequence state manager.
@@ -476,6 +530,42 @@ impl Sequence {
 			Ok(_) => {
 				tx.commit().await?;
 				Ok(v)
+			}
+			Err(e) => {
+				tx.cancel().await?;
+				Err(e)
+			}
+		}
+	}
+
+	/// Allocates N IDs at once, returning the starting value.
+	///
+	/// This is an optimized version of `next` that allocates multiple IDs
+	/// in a single operation with only one state persistence.
+	async fn next_n(
+		&mut self,
+		sqs: &Sequences,
+		ctx: Option<&Context>,
+		seq: &SequenceDomain,
+		count: usize,
+		batch: u32,
+	) -> Result<i64> {
+		let count = count as i64;
+		// Ensure we have enough IDs in the current batch
+		while self.st.next + count > self.to {
+			(self.st.next, self.to) =
+				Self::find_batch_allocation(sqs, ctx, seq, self.st.next, batch.max(count as u32), self.timeout)
+					.await?;
+		}
+		let start = self.st.next;
+		self.st.next += count;
+		// Write the state on the KV store (only once for all N IDs)
+		let tx =
+			self.tf.transaction(TransactionType::Write, LockType::Optimistic, sqs.clone()).await?;
+		match tx.set(&self.state_key, &revision::to_vec(&self.st)?, None).await {
+			Ok(_) => {
+				tx.commit().await?;
+				Ok(start)
 			}
 			Err(e) => {
 				tx.cancel().await?;

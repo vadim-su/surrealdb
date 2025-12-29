@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::ctx::FrozenContext;
 use crate::idx::IndexKeyBase;
-use crate::kvs::Transaction;
+use crate::kvs::{KVKey, KVValue, Transaction};
 use crate::val::RecordIdKey;
 
 pub type DocId = u64;
@@ -116,6 +116,60 @@ impl SeqDocIds {
 			tx.set(&k, &id, None).await?;
 		}
 		Ok(Resolved::New(new_doc_id))
+	}
+
+	/// Resolves multiple record IDs to document IDs in batch, creating new ones.
+	///
+	/// This is an optimized method for bulk indexing that:
+	/// - Skips existence checks (assumes all documents are new)
+	/// - Allocates all IDs at once from the sequence
+	/// - Uses batch_write for all mappings
+	///
+	/// # Arguments
+	/// * `ctx` - The context containing transaction and sequence information
+	/// * `ids` - The record IDs to resolve
+	///
+	/// # Returns
+	/// A vector of document IDs in the same order as the input
+	pub(in crate::idx) async fn resolve_doc_ids_batch(
+		&self,
+		ctx: &FrozenContext,
+		ids: Vec<RecordIdKey>,
+	) -> Result<Vec<DocId>> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+
+		let count = ids.len();
+		let tx = ctx.tx();
+
+		// Allocate all IDs at once from the sequence
+		let id_range = ctx
+			.try_get_sequences()?
+			.allocate_fts_doc_ids(Some(ctx), self.ikb.clone(), count, self.batch)
+			.await?;
+
+		// Build all key-value pairs for batch write
+		let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(count * 2);
+		let mut doc_ids = Vec::with_capacity(count);
+
+		for (i, id) in ids.into_iter().enumerate() {
+			let doc_id = id_range.start + i as DocId;
+			doc_ids.push(doc_id);
+
+			// id_key -> doc_id (record ID to document ID mapping)
+			let id_key = self.ikb.new_id_key(id.clone());
+			entries.push((id_key.encode_key()?, doc_id.kv_encode_value()?));
+
+			// ii_key -> id (document ID to record ID mapping)
+			let ii_key = self.ikb.new_ii_key(doc_id);
+			entries.push((ii_key.encode_key()?, id.kv_encode_value()?));
+		}
+
+		// Write all mappings in a single batch
+		tx.batch_write(entries).await?;
+
+		Ok(doc_ids)
 	}
 
 	/// Retrieves a record ID for a given document ID

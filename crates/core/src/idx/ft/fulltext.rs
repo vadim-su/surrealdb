@@ -549,12 +549,12 @@ impl FullTextIndex {
 		let nid = opt.id();
 		let mut batch = TermBatch::new(self.use_accurate_scoring);
 
-		// Process all documents and accumulate writes
-		for (rid, content) in documents {
-			// Resolve doc_id
-			let id = self.doc_ids.resolve_doc_id(ctx, rid.key.clone()).await?;
-			let doc_id = id.doc_id();
+		// Collect all record IDs and resolve them in batch
+		let record_ids: Vec<_> = documents.iter().map(|(rid, _)| rid.key.clone()).collect();
+		let doc_ids = self.doc_ids.resolve_doc_ids_batch(ctx, record_ids).await?;
 
+		// Process all documents with pre-resolved doc_ids
+		for ((_, content), doc_id) in documents.iter().zip(doc_ids.into_iter()) {
 			// Tokenize content
 			let tokens = self
 				.analyzer
